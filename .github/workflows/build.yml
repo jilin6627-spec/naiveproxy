@@ -2,7 +2,9 @@ name: Build
 on:
   push:
     branches: [master]
-    paths-ignore: [README.md]
+    paths-ignore:
+      - README.md
+      - .github/workflows/**
   release:
     types: [published]
 defaults:
@@ -579,3 +581,4 @@ jobs:
         run: gh release upload "${GITHUB_REF##*/}" ${{ env.BUNDLE }}.tar.xz --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

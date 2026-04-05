@@ -1,0 +1,143 @@
+name: Build Debian Linux x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_tag:
+        description: '构建标识 (自定义版本标签)'
+        required: false
+        default: 'debian-custom'
+      extra_gn_args:
+        description: '额外 GN 构建参数 (可选)'
+        required: false
+        default: ''
+
+defaults:
+  run:
+    shell: bash
+    working-directory: src
+
+env:
+  CACHE_EPOCH: 1
+  CCACHE_MAXSIZE: 200M
+  CCACHE_MAXFILES: 0
+
+jobs:
+  build-linux-x64:
+    runs-on: ubuntu-22.04
+    env:
+      EXTRA_FLAGS: 'target_cpu="x64"'
+      BUNDLE: naiveproxy-custom-${{ github.event.inputs.build_tag }}-linux-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+          key: toolchains-posix-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+
+      - name: Cache PGO profiles
+        uses: actions/cache@v4
+        with:
+          path: src/chrome/build/pgo_profiles/
+          key: pgo-linux-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+
+      - name: Cache sysroot
+        uses: actions/cache@v4
+        with:
+          path: |
+            src/out/sysroot-build/bullseye/bullseye_*
+            src/out/sysroot-build/trixie/trixie_*
+          key: sysroot-linux-x64-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+
+      - id: ccache-timestamp
+        run: echo "CCACHE_TIMESTAMP=$(date +%s)" >>$GITHUB_OUTPUT
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-linux-x64-${{ hashFiles('CHROMIUM_VERSION') }}-${{ steps.ccache-timestamp.outputs.CCACHE_TIMESTAMP }}
+          restore-keys: ccache-linux-x64-${{ hashFiles('CHROMIUM_VERSION') }}-
+
+      - name: Install APT packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config ccache bubblewrap
+          sudo apt-get remove -y libc6-i386 || true
+
+      - name: Regenerate Debian keyring
+        run: |
+          rm -f ./build/linux/sysroot_scripts/keyring.gpg
+          GPG_TTY=/dev/null ./build/linux/sysroot_scripts/generate_keyring.sh
+
+      - name: Get Clang toolchain
+        run: ./get-clang.sh
+
+      - name: Zero ccache stats
+        run: ccache -z
+
+      - name: Build naiveproxy
+        run: |
+          if [ -n "${{ github.event.inputs.extra_gn_args }}" ]; then
+            EXTRA_FLAGS="target_cpu=\"x64\" ${{ github.event.inputs.extra_gn_args }}" ./build.sh
+          else
+            ./build.sh
+          fi
+
+      - name: Show ccache stats
+        run: ccache -s && ccache --evict-older-than 1d
+
+      - name: Run basic tests
+        run: ../tests/basic.sh out/Release/naive
+
+      - name: Collect build info
+        id: build_info
+        run: |
+          CHROMIUM_VER=$(cat ../CHROMIUM_VERSION)
+          BUILD_DATE=$(date -u '+%Y%m%d-%H%M%S')
+          FILE_SIZE=$(du -sh out/Release/naive | cut -f1)
+          SHA256=$(openssl sha256 out/Release/naive | awk '{print $2}')
+          echo "chromium_ver=$CHROMIUM_VER" >>$GITHUB_OUTPUT
+          echo "build_date=$BUILD_DATE" >>$GITHUB_OUTPUT
+          echo "file_size=$FILE_SIZE" >>$GITHUB_OUTPUT
+          echo "sha256=$SHA256" >>$GITHUB_OUTPUT
+          echo "SHA256=$SHA256" >>$GITHUB_ENV
+
+      - name: Pack artifact
+        run: |
+          mkdir -p ${{ env.BUNDLE }}
+          cp out/Release/naive ${{ env.BUNDLE }}/
+          cp ../LICENSE ../USAGE.txt ${{ env.BUNDLE }}/
+          printf "Build Tag    : %s\nChromium Ver : %s\nBuild Date   : %s\nPlatform     : Linux x64 (Debian compatible)\nSHA256       : %s\nBinary Size  : %s\nCommit       : %s\n" \
+            "${{ github.event.inputs.build_tag }}" \
+            "${{ steps.build_info.outputs.chromium_ver }}" \
+            "${{ steps.build_info.outputs.build_date }}" \
+            "${{ steps.build_info.outputs.sha256 }}" \
+            "${{ steps.build_info.outputs.file_size }}" \
+            "${{ github.sha }}" \
+            > ${{ env.BUNDLE }}/BUILD_INFO.txt
+          tar cJf ${{ env.BUNDLE }}.tar.xz ${{ env.BUNDLE }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE }}.tar.xz [sha256=${{ env.SHA256 }}]
+          path: src/${{ env.BUNDLE }}.tar.xz
+          retention-days: 30
+
+      - name: Build Summary
+        run: |
+          echo "## Build Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Chromium | ${{ steps.build_info.outputs.chromium_ver }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | Linux x64 (Debian) |" >> $GITHUB_STEP_SUMMARY
+          echo "| SHA256 | \`${{ steps.build_info.outputs.sha256 }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Size | ${{ steps.build_info.outputs.file_size }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Date | ${{ steps.build_info.outputs.build_date }} |" >> $GITHUB_STEP_SUMMARY

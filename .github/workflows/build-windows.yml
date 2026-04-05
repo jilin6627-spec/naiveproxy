@@ -1,0 +1,127 @@
+name: Build Windows x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_tag:
+        description: '构建标识'
+        required: false
+        default: 'win-x64-custom'
+
+defaults:
+  run:
+    shell: bash
+    working-directory: src
+
+env:
+  CACHE_EPOCH: 1
+  SCCACHE_CACHE_SIZE: 200M
+
+jobs:
+  build-win-x64:
+    runs-on: windows-2022
+    env:
+      EXTRA_FLAGS: 'target_cpu="x64"'
+      BUNDLE: naiveproxy-custom-${{ github.event.inputs.build_tag }}-win-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            src/third_party/llvm-build/Release+Asserts/
+            src/gn/
+            ~/.cargo/bin/
+            ~/bin/ninja.exe
+          key: toolchains-win-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+
+      - name: Cache PGO (win64)
+        uses: actions/cache@v4
+        with:
+          path: src/chrome/build/pgo_profiles/chrome-win64-*
+          key: pgo-win64-${{ hashFiles('CHROMIUM_VERSION') }}-v${{ env.CACHE_EPOCH }}
+
+      - id: ccache-timestamp
+        run: echo "CCACHE_TIMESTAMP=$(date +%s)" >>$GITHUB_OUTPUT
+
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: ~/AppData/Local/Mozilla/sccache
+          key: ccache-win-x64-${{ hashFiles('CHROMIUM_VERSION') }}-${{ steps.ccache-timestamp.outputs.CCACHE_TIMESTAMP }}
+          restore-keys: ccache-win-x64-${{ hashFiles('CHROMIUM_VERSION') }}-
+
+      - name: Install ninja
+        run: |
+          if [ ! -f ~/bin/ninja.exe ]; then
+            curl -LO https://github.com/ninja-build/ninja/releases/download/v1.10.2/ninja-win.zip
+            unzip ninja-win.zip -d ~/bin
+          fi
+
+      - name: Get Clang toolchain
+        run: EXTRA_FLAGS='target_cpu="x64"' ./get-clang.sh
+
+      - name: Install sccache
+        run: |
+          if [ ! -f ~/.cargo/bin/sccache ]; then
+            curl -LO https://github.com/mozilla/sccache/releases/download/v0.2.15/sccache-v0.2.15-x86_64-pc-windows-msvc.tar.gz
+            tar xf sccache-*.tar.gz
+            cp sccache-*/sccache.exe ~/.cargo/bin/
+          fi
+
+      - name: Zero sccache stats
+        run: ~/.cargo/bin/sccache -z
+
+      - name: Build naiveproxy
+        run: ./build.sh
+
+      - name: Show sccache stats
+        run: ~/.cargo/bin/sccache -s
+
+      - name: Run basic tests
+        run: ../tests/basic.sh out/Release/naive
+
+      - name: Collect build info
+        id: build_info
+        run: |
+          CHROMIUM_VER=$(cat ../CHROMIUM_VERSION)
+          BUILD_DATE=$(date -u '+%Y%m%d-%H%M%S')
+          SHA256=$(openssl sha256 out/Release/naive.exe | awk '{print $2}')
+          echo "chromium_ver=$CHROMIUM_VER" >>$GITHUB_OUTPUT
+          echo "build_date=$BUILD_DATE" >>$GITHUB_OUTPUT
+          echo "sha256=$SHA256" >>$GITHUB_OUTPUT
+          echo "SHA256=$SHA256" >>$GITHUB_ENV
+
+      - name: Pack artifact
+        run: |
+          mkdir -p ${{ env.BUNDLE }}
+          cp out/Release/naive.exe ${{ env.BUNDLE }}/
+          cp ../LICENSE ../USAGE.txt ${{ env.BUNDLE }}/
+          printf "Build Tag    : %s\nChromium Ver : %s\nBuild Date   : %s\nPlatform     : Windows x64\nSHA256       : %s\nCommit       : %s\n" \
+            "${{ github.event.inputs.build_tag }}" \
+            "${{ steps.build_info.outputs.chromium_ver }}" \
+            "${{ steps.build_info.outputs.build_date }}" \
+            "${{ steps.build_info.outputs.sha256 }}" \
+            "${{ github.sha }}" \
+            > ${{ env.BUNDLE }}/BUILD_INFO.txt
+          7z a ${{ env.BUNDLE }}.zip ${{ env.BUNDLE }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.BUNDLE }}.zip [sha256=${{ env.SHA256 }}]
+          path: src/${{ env.BUNDLE }}.zip
+          retention-days: 30
+
+      - name: Build Summary
+        run: |
+          echo "## Build Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Chromium | ${{ steps.build_info.outputs.chromium_ver }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Platform | Windows x64 |" >> $GITHUB_STEP_SUMMARY
+          echo "| SHA256 | \`${{ steps.build_info.outputs.sha256 }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Date | ${{ steps.build_info.outputs.build_date }} |" >> $GITHUB_STEP_SUMMARY
